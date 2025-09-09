@@ -135,7 +135,7 @@ export class TwitterService {
     try {
       const {
         sinceTime,
-        maxResults = 10,
+        maxResults = 2,
         includeReplies = false,
         includeRetweets = false,
         keywords = []
@@ -146,7 +146,7 @@ export class TwitterService {
       if (!includeRetweets) excludeTypes.push('retweets');
 
       const params: any = {
-        max_results: Math.min(maxResults, 100), // Twitter API limit
+        max_results: Math.min(maxResults, 2), // Twitter API limit
         exclude: excludeTypes,
         'tweet.fields': [
           'created_at',
@@ -208,7 +208,7 @@ export class TwitterService {
       // Fetch tweets since last check
       const tweets = await this.getUserTweets(targetUser.id, {
         sinceTime: subscription.lastChecked,
-        maxResults: 50,
+        maxResults: 2,
         includeReplies: subscription.includeReplies,
         includeRetweets: subscription.includeRetweets,
         keywords: subscription.keywords
