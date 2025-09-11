@@ -12,6 +12,7 @@ import dotenv from 'dotenv';
 
 import { User, Subscription, Post, ActivityLog, aggregationPipelines } from './models';
 import { TwitterService } from './twitter-service';
+import AISummarizationService from './services/ai-summarization';
 import logger from './utils/logger';
 
 // Load environment variables
@@ -517,6 +518,328 @@ app.get('/api/analytics', authenticateToken, async (req: AuthRequest, res) => {
   } catch (error: any) {
     logger.error('Analytics error:', error);
     res.status(500).json({ error: 'Failed to fetch analytics' });
+  }
+});
+
+// AI SUMMARIZATION ENDPOINTS
+
+// Get AI-summarized updates
+app.get('/api/updates/summarized', authenticateToken, async (req: AuthRequest, res) => {
+  try {
+    const userId = req.user!.userId;
+    const since = req.query.since ? new Date(req.query.since as string) : new Date(Date.now() - 24 * 60 * 60 * 1000);
+    const analysisType = (req.query.type as string) || 'quick'; // quick, detailed, insights
+    const limit = parseInt(req.query.limit as string) || 20;
+
+    // Get posts from subscriptions
+    const posts = await Post.find({
+      userId: new mongoose.Types.ObjectId(userId),
+      tweetCreatedAt: { $gte: since }
+    })
+    .populate('subscriptionId', 'targetUsername')
+    .sort({ tweetCreatedAt: -1 })
+    .limit(limit)
+    .lean();
+
+    if (posts.length === 0) {
+      return res.json({
+        summary: 'No recent tweets found from your subscriptions.',
+        posts: [],
+        count: 0,
+        analysis: null
+      });
+    }
+
+    // Generate AI summary
+    const analysis = await AISummarizationService.summarizeTweets(posts, {
+      userId,
+      analysisType: analysisType as 'quick' | 'detailed' | 'insights'
+    });
+
+    // Log activity
+    await logActivity(userId, 'ai_summary_generated', {
+      postCount: posts.length,
+      analysisType,
+      tokensUsed: analysis.tokensUsed
+    }, req);
+
+    res.json({
+      summary: analysis.summary,
+      keyTopics: analysis.keyTopics,
+      sentiment: analysis.sentiment,
+      insights: (analysis as any).insights,
+      posts: posts.map(post => ({
+        id: post._id,
+        tweetId: post.tweetId,
+        content: post.content.substring(0, 150) + '...',
+        authorUsername: post.authorUsername,
+        engagement: post.engagement,
+        tweetCreatedAt: post.tweetCreatedAt,
+        tweetUrl: post.tweetUrl
+      })),
+      count: posts.length,
+      analysis: {
+        tokensUsed: analysis.tokensUsed,
+        model: analysisType,
+        generatedAt: new Date()
+      }
+    });
+
+  } catch (error: any) {
+    logger.error('AI summarization error:', error);
+    res.status(500).json({
+      error: error.message || 'Failed to generate AI summary',
+      fallback: 'Try using the regular /api/updates endpoint'
+    });
+  }
+});
+
+// Quick summary endpoint (optimized for speed)
+app.get('/api/updates/quick-summary', authenticateToken, async (req: AuthRequest, res) => {
+  try {
+    const userId = req.user!.userId;
+    const since = req.query.since ? new Date(req.query.since as string) : new Date(Date.now() - 24 * 60 * 60 * 1000);
+
+    // Get only recent posts (limit to 10 for quick processing)
+    const posts = await Post.find({
+      userId: new mongoose.Types.ObjectId(userId),
+      tweetCreatedAt: { $gte: since }
+    })
+    .sort({ tweetCreatedAt: -1 })
+    .limit(10)
+    .lean();
+
+    if (posts.length === 0) {
+      return res.json({
+        summary: 'No recent activity from your subscriptions.',
+        count: 0
+      });
+    }
+
+    // Use quick summarization
+    const summary = await AISummarizationService.quickSummarize(posts, userId);
+
+    await logActivity(userId, 'quick_summary_generated', { postCount: posts.length }, req);
+
+    res.json({
+      summary,
+      count: posts.length,
+      lastUpdated: new Date(),
+      type: 'quick'
+    });
+
+  } catch (error: any) {
+    logger.error('Quick summary error:', error);
+    res.status(500).json({ error: 'Failed to generate quick summary' });
+  }
+});
+
+// Detailed analysis endpoint
+app.get('/api/updates/detailed-analysis', authenticateToken, async (req: AuthRequest, res) => {
+  try {
+    const userId = req.user!.userId;
+    const days = parseInt(req.query.days as string) || 1;
+    const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+
+    // Get more posts for detailed analysis
+    const posts = await Post.find({
+      userId: new mongoose.Types.ObjectId(userId),
+      tweetCreatedAt: { $gte: since }
+    })
+    .populate('subscriptionId', 'targetUsername')
+    .sort({ tweetCreatedAt: -1 })
+    .limit(50)
+    .lean();
+
+    if (posts.length === 0) {
+      return res.json({
+        error: 'No tweets found for analysis',
+        suggestion: 'Try refreshing your subscriptions first'
+      });
+    }
+
+    // Generate detailed analysis
+    const analysis = await AISummarizationService.detailedAnalysis(posts, userId);
+
+    // Get additional stats
+    const subscriptionStats = await Subscription.aggregate([
+      { $match: { userId: new mongoose.Types.ObjectId(userId), isActive: true } },
+      {
+        $lookup: {
+          from: 'posts',
+          localField: '_id',
+          foreignField: 'subscriptionId',
+          as: 'recentPosts',
+          pipeline: [
+            { $match: { tweetCreatedAt: { $gte: since } } },
+            { $sort: { tweetCreatedAt: -1 } }
+          ]
+        }
+      },
+      {
+        $project: {
+          targetUsername: 1,
+          postCount: { $size: '$recentPosts' },
+          avgEngagement: {
+            $cond: {
+              if: { $gt: [{ $size: '$recentPosts' }, 0] },
+              then: {
+                $avg: {
+                  $map: {
+                    input: '$recentPosts',
+                    as: 'post',
+                    in: {
+                      $add: [
+                        { $ifNull: ['$post.engagement.likes', 0] },
+                        { $ifNull: ['$post.engagement.retweets', 0] }
+                      ]
+                    }
+                  }
+                }
+              },
+              else: 0
+            }
+          }
+        }
+      }
+    ]);
+
+    await logActivity(userId, 'detailed_analysis_generated', {
+      postCount: posts.length,
+      days,
+      tokensUsed: analysis.tokensUsed
+    }, req);
+
+    res.json({
+      summary: analysis.summary,
+      keyTopics: analysis.keyTopics,
+      sentiment: analysis.sentiment,
+      insights: (analysis as any).insights,
+      stats: {
+        totalPosts: posts.length,
+        daysCovered: days,
+        subscriptionBreakdown: subscriptionStats,
+        tokensUsed: analysis.tokensUsed
+      },
+      generatedAt: new Date(),
+      type: 'detailed'
+    });
+
+  } catch (error: any) {
+    logger.error('Detailed analysis error:', error);
+    res.status(500).json({ 
+      error: 'Failed to generate detailed analysis',
+      details: error.message,
+      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
+  }
+});
+
+// Refresh and summarize endpoint (combines refresh with AI summary)
+app.post('/api/subscriptions/refresh-and-summarize', authenticateToken, async (req: AuthRequest, res) => {
+  try {
+    const userId = req.user!.userId;
+
+    // Get all active subscriptions
+    const subscriptions = await Subscription.find({
+      userId: new mongoose.Types.ObjectId(userId),
+      isActive: true
+    });
+
+    if (subscriptions.length === 0) {
+      return res.status(400).json({ error: 'No active subscriptions found' });
+    }
+
+    // Refresh all subscriptions
+    let totalNewTweets = 0;
+    const errors: string[] = [];
+
+    const twitterService = await TwitterService.createForUser(new mongoose.Types.ObjectId(userId));
+    if (!twitterService) {
+      return res.status(400).json({ error: 'Twitter service unavailable' });
+    }
+
+    for (const subscription of subscriptions) {
+      try {
+        const newTweetsCount = await twitterService.processSubscriptionTweets(subscription);
+        totalNewTweets += newTweetsCount;
+
+        // Add small delay between subscriptions
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      } catch (error: any) {
+        errors.push(`${subscription.targetUsername}: ${error.message}`);
+      }
+    }
+
+    // Get the newly fetched tweets for summarization
+    const recentPosts = await Post.find({
+      userId: new mongoose.Types.ObjectId(userId),
+      createdAt: { $gte: new Date(Date.now() - 10 * 60 * 1000) } // Last 10 minutes
+    })
+    .sort({ tweetCreatedAt: -1 })
+    .limit(20)
+    .lean();
+
+    let aiSummary = null;
+    if (recentPosts.length > 0) {
+      try {
+        aiSummary = await AISummarizationService.quickSummarize(recentPosts, userId);
+      } catch (summaryError: any) {
+        logger.error('AI summary failed during refresh:', summaryError);
+      }
+    }
+
+    await logActivity(userId, 'refresh_and_summarize', {
+      subscriptionsProcessed: subscriptions.length,
+      totalNewTweets,
+      errorCount: errors.length,
+      aiSummaryGenerated: !!aiSummary
+    }, req);
+
+    res.json({
+      success: true,
+      message: `Refresh completed. ${totalNewTweets} new tweets found.`,
+      stats: {
+        subscriptionsProcessed: subscriptions.length,
+        newTweets: totalNewTweets,
+        errors: errors.length > 0 ? errors : undefined
+      },
+      aiSummary: aiSummary || 'No new tweets to summarize',
+      timestamp: new Date()
+    });
+
+  } catch (error: any) {
+    logger.error('Refresh and summarize error:', error);
+    res.status(500).json({ error: 'Failed to refresh and summarize' });
+  }
+});
+
+// AI service health check
+app.get('/api/ai/health', authenticateToken, async (req: AuthRequest, res) => {
+  try {
+    // Test with a simple summarization request
+    const testTweets = [{
+      content: 'This is a test tweet to verify AI service connectivity.',
+      authorUsername: 'test',
+      engagement: { likes: 0, retweets: 0, replies: 0, quotes: 0 },
+      tweetCreatedAt: new Date()
+    }];
+
+    const result = await AISummarizationService.quickSummarize(testTweets, req.user!.userId);
+
+    res.json({
+      status: 'healthy',
+      aiService: 'openrouter',
+      testSummary: result.substring(0, 100),
+      timestamp: new Date()
+    });
+
+  } catch (error: any) {
+    res.status(500).json({
+      status: 'unhealthy',
+      error: error.message,
+      suggestion: 'Check OPENROUTER_API_KEY configuration'
+    });
   }
 });
 
